@@ -1,10 +1,16 @@
 package com.example.audioapp.utils;
 
+import android.content.Context;
+import android.content.res.AssetFileDescriptor;
 import android.os.Environment;
 import android.text.TextUtils;
 import android.util.Log;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -219,4 +225,15 @@ public class FileUtil {
         }
         return list;
     }
+
+    // In FileUtil.java:
+    public static MappedByteBuffer loadModelFile(Context context, String modelName) throws IOException {
+        AssetFileDescriptor fileDescriptor = context.getAssets().openFd(modelName);
+        FileInputStream inputStream = new FileInputStream(fileDescriptor.getFileDescriptor());
+        FileChannel fileChannel = inputStream.getChannel();
+        long startOffset = fileDescriptor.getStartOffset();
+        long declaredLength = fileDescriptor.getDeclaredLength();
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
+    }
+
 }

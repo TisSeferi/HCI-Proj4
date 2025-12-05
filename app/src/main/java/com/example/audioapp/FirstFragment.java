@@ -5,6 +5,9 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.BitmapFactory;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -30,6 +33,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
 import androidx.navigation.NavController;
 import androidx.navigation.Navigation;
@@ -46,6 +50,7 @@ import android.net.Uri;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -56,7 +61,31 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
+import org.tensorflow.lite.Interpreter;
+import android.graphics.Bitmap;
+import android.graphics.ImageFormat;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+
+import com.google.common.util.concurrent.ListenableFuture;
+import java.nio.ByteBuffer;
+
+
 public class FirstFragment extends Fragment {
+
+    // === TFLite Recognition ===
+    private Interpreter tflite;
+    private TextView recognitionOutput;
+
+    // These match your model input
+    private final int IMG_HEIGHT = 64;
+    private final int IMG_WIDTH = 256;
+
+    // For throttled inference
+    private long lastInferenceTime = 0;
+
     private TextView motionText = null;
 
     private SensorManager mSensorManager;
@@ -239,7 +268,165 @@ public class FirstFragment extends Fragment {
         }
     }
 
+    private void runRecognition(ImageProxy image) {
+        long now = System.currentTimeMillis();
+        if (now - lastInferenceTime < 250) return;    // limit to 4 FPS
+        lastInferenceTime = now;
+
+        if (tflite == null) return;
+
+        Bitmap bmp = toBitmap(image);
+        Bitmap resized = Bitmap.createScaledBitmap(bmp, IMG_WIDTH, IMG_HEIGHT, false);
+
+        ByteBuffer inputBuffer = ByteBuffer.allocateDirect(IMG_HEIGHT * IMG_WIDTH);
+        inputBuffer.rewind();
+
+        int[] pixels = new int[IMG_HEIGHT * IMG_WIDTH];
+        resized.getPixels(pixels, 0, IMG_WIDTH, 0, 0, IMG_WIDTH, IMG_HEIGHT);
+
+        for (int p : pixels) {
+            int r = (p >> 16) & 0xFF;
+            inputBuffer.put((byte) (255 - r)); // invert
+        }
+
+        float[][][] output = new float[1][64][63]; // your model shape
+
+        tflite.run(inputBuffer, output);
+
+        String text = decodeGreedy(output);
+        updateRecognition(text);
+    }
+
+    private void updateRecognition(String text) {
+        getActivity().runOnUiThread(() -> recognitionOutput.setText("Prediction: " + text));
+    }
+
+    private Bitmap toBitmap(ImageProxy image) {
+        ImageProxy.PlaneProxy[] planes = image.getPlanes();
+        ByteBuffer buffer = planes[0].getBuffer();
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+
+        YuvImage yuvImage = new YuvImage(bytes, ImageFormat.NV21,
+                image.getWidth(), image.getHeight(), null);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        yuvImage.compressToJpeg(new Rect(0,0,image.getWidth(),image.getHeight()), 50, out);
+        byte[] jpegBytes = out.toByteArray();
+
+        return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+    }
+
+    private String decodeGreedy(float[][][] preds) {
+        StringBuilder sb = new StringBuilder();
+
+        int lastChar = -1;
+        for (int t = 0; t < preds[0].length; t++) {
+            float maxVal = -999f;
+            int maxIdx = -1;
+
+            for (int c = 0; c < preds[0][t].length; c++) {
+                if (preds[0][t][c] > maxVal) {
+                    maxVal = preds[0][t][c];
+                    maxIdx = c;
+                }
+            }
+
+            if (maxIdx != lastChar && maxIdx < 62) {  // ignore blank
+                sb.append((char)(uniqueCharFromIndex(maxIdx)));
+            }
+
+            lastChar = maxIdx;
+        }
+
+        return sb.toString();
+    }
+
+    private char uniqueCharFromIndex(int idx) {
+        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        if (idx >= 0 && idx < alphabet.length()) {
+            return alphabet.charAt(idx);
+        }
+        return '?'; // fallback
+    }
+
+
+
+
+    // =============================
+    // START CAMERA + RECOGNITION
+    // =============================
+    private void startCameraRecognition() {
+
+        // ===== STEP 2: Camera permission check =====
+        if (ActivityCompat.checkSelfPermission(
+                getContext(), Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+
+            ActivityCompat.requestPermissions(
+                    getActivity(),
+                    new String[]{Manifest.permission.CAMERA},
+                    1001
+            );
+            return; // STOP, cannot start camera yet
+        }
+        // ============================================
+
+        ListenableFuture<ProcessCameraProvider> cameraProviderFuture =
+                ProcessCameraProvider.getInstance(getContext());
+
+        cameraProviderFuture.addListener(() -> {
+            try {
+                ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
+
+                ImageAnalysis analysis = new ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build();
+
+                analysis.setAnalyzer(
+                        Runnable::run,
+                        image -> {
+                            runRecognition(image);
+                            image.close();
+                        }
+                );
+
+                CameraSelector cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA;
+
+                cameraProvider.unbindAll();
+                cameraProvider.bindToLifecycle(
+                        this,
+                        cameraSelector,
+                        analysis
+                );
+
+            } catch (Exception e) {
+                Log.e("CAMERA", "CameraX init error", e);
+            }
+        }, ContextCompat.getMainExecutor(getContext()));
+    }
+
+
+
     public void onViewCreated(@NonNull View view, Bundle savedInstanceState) {
+
+        // Load tflite model from assets
+        try {
+            Interpreter.Options options = new Interpreter.Options();
+            options.setNumThreads(2);
+            tflite = new Interpreter(
+                    FileUtil.loadModelFile(getContext(), "model.tflite"),
+                    options
+            );
+        } catch (Exception e) {
+            Log.e("TFLITE", "Failed to load model", e);
+        }
+
+        recognitionOutput = view.findViewById(R.id.recognition_output);
+
+        // Start continuous recognition
+        startCameraRecognition();
+
+
         super.onViewCreated(view, savedInstanceState);
         Log.e("111", "onViewCreated");
         FileUtil.setBasePath(getActivity().getExternalFilesDir(null).toString());
