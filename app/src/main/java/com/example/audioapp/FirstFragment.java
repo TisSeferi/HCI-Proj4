@@ -56,14 +56,19 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteOrder;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import org.json.JSONArray;
+import org.json.JSONException;
 import org.tensorflow.lite.Interpreter;
 
 import android.graphics.Bitmap;
@@ -82,6 +87,7 @@ public class FirstFragment extends Fragment {
     // === TFLite Recognition ===
     private Interpreter tflite;
     private TextView recognitionOutput;
+    private List<String> vocabList; // Loaded from vocab.json
 
     // These match your model input
     private final int IMG_HEIGHT = 64;
@@ -278,47 +284,66 @@ public class FirstFragment extends Fragment {
 
     private void runRecognition(ImageProxy image) {
         long now = System.currentTimeMillis();
-        if (now - lastInferenceTime < 250) return;    // limit to 4 FPS
+        if (now - lastInferenceTime < 500) return;    // Currently 4 FPS (~every 250ms)
         lastInferenceTime = now;
 
         if (tflite == null) return;
 
-        Bitmap bmp = toBitmap(image);
-        Bitmap resized = Bitmap.createScaledBitmap(bmp, IMG_WIDTH, IMG_HEIGHT, false);
+        // Start timing: image capture time (approximation)
+        long captureTime = System.currentTimeMillis();
 
-        ByteBuffer inputBuffer =
-                ByteBuffer.allocateDirect(IMG_HEIGHT * IMG_WIDTH * 4);
+        Bitmap bmp = toBitmap(image);
+        if (bmp == null) return;
+
+        // Extract center band (38% of height) BEFORE resize - like Project 2
+        float bandFrac = 0.38f;
+        int bandHeight = Math.round(bmp.getHeight() * bandFrac);
+        int bandTop = (bmp.getHeight() - bandHeight) / 2;
+        Bitmap bandCropped = Bitmap.createBitmap(bmp, 0, bandTop, bmp.getWidth(), bandHeight);
+
+        // Resize the cropped band to model input size
+        Bitmap resized = Bitmap.createScaledBitmap(bandCropped, IMG_WIDTH, IMG_HEIGHT, false);
+
+        // Allocate input buffer for float32 (4 bytes per value)
+        ByteBuffer inputBuffer = ByteBuffer.allocateDirect(IMG_WIDTH * IMG_HEIGHT * 4);
         inputBuffer.order(ByteOrder.nativeOrder());
 
-        int[] pixels = new int[IMG_HEIGHT * IMG_WIDTH];
+        int[] pixels = new int[IMG_WIDTH * IMG_HEIGHT];
         resized.getPixels(pixels, 0, IMG_WIDTH, 0, 0, IMG_WIDTH, IMG_HEIGHT);
 
+        // Process pixels: conditional invert (like Project 2) + normalize
+        // Calculate mean brightness
+        int sum = 0;
         for (int p : pixels) {
             int r = (p >> 16) & 0xFF;
-            float normalized = (255 - r) / 255.0f;
-            inputBuffer.putFloat(normalized);
+            sum += r;
+        }
+        double mean = sum / (double) pixels.length;
+
+        // Invert only if background is very dark (mean < 115)
+        for (int p : pixels) {
+            int r = (p >> 16) & 0xFF;
+            float value = mean < 115 ? (255 - r) / 255.0f : r / 255.0f;
+            inputBuffer.putFloat(value);
         }
         inputBuffer.rewind();
-        resized.getPixels(pixels, 0, IMG_WIDTH, 0, 0, IMG_WIDTH, IMG_HEIGHT);
 
-        for (int p : pixels) {
-            int r = (p >> 16) & 0xFF;
-            inputBuffer.put((byte) (255 - r)); // invert
-        }
-
-        float[][][] output = new float[1][64][63]; // your model shape
-
-        Log.d("TFLITE", "Running inference...");
+        float[][][] output = new float[1][64][63]; // model output shape
 
         long t0 = System.currentTimeMillis();
         tflite.run(inputBuffer, output);
         long t1 = System.currentTimeMillis();
+        long inferenceDuration = t1 - t0;
 
-        Log.d("TFLITE", "Inference complete in " + (t1 - t0) + " ms");
+        Log.d("TFLITE", "Inference complete in " + inferenceDuration + " ms");
         Log.d("TFLITE", "First timestep max class: " + argMax(output[0][0]));
 
-
         String text = decodeGreedy(output);
+        long displayTime = System.currentTimeMillis();
+        long endToEndLatency = displayTime - captureTime;
+        
+        // Log end-to-end latency for evaluation
+        Log.d("LATENCY_E2E", "E2E: " + endToEndLatency + "ms | Inference: " + inferenceDuration + "ms");
         updateRecognition(text);
     }
 
@@ -335,7 +360,12 @@ public class FirstFragment extends Fragment {
     }
 
     private void updateRecognition(String text) {
-        getActivity().runOnUiThread(() -> recognitionOutput.setText("Prediction: " + text));
+        if (getActivity() == null || recognitionOutput == null) return;
+        getActivity().runOnUiThread(() -> {
+            if (recognitionOutput != null) {
+                recognitionOutput.setText("Prediction: " + text);
+            }
+        });
     }
 
     private Bitmap toBitmap(ImageProxy image) {
@@ -381,6 +411,7 @@ public class FirstFragment extends Fragment {
     private String decodeGreedy(float[][][] preds) {
         StringBuilder sb = new StringBuilder();
 
+        int blankIndex = vocabList != null ? vocabList.size() : 62;
         int lastChar = -1;
         for (int t = 0; t < preds[0].length; t++) {
             float maxVal = -999f;
@@ -393,8 +424,8 @@ public class FirstFragment extends Fragment {
                 }
             }
 
-            if (maxIdx != lastChar && maxIdx < 62) {  // ignore blank
-                sb.append((char)(uniqueCharFromIndex(maxIdx)));
+            if (maxIdx != lastChar && maxIdx < blankIndex) {  // ignore blank
+                sb.append(uniqueCharFromIndex(maxIdx));
             }
 
             lastChar = maxIdx;
@@ -404,12 +435,37 @@ public class FirstFragment extends Fragment {
     }
 
     private char uniqueCharFromIndex(int idx) {
-        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        if (idx >= 0 && idx < alphabet.length()) {
-            return alphabet.charAt(idx);
+        if (vocabList != null && idx >= 0 && idx < vocabList.size()) {
+            return vocabList.get(idx).charAt(0);
         }
         return '?'; // fallback
     }
+
+    private void loadVocabFromAssets() {
+        try {
+            InputStream inputStream = getContext().getAssets().open("vocab.json");
+            byte[] buffer = new byte[inputStream.available()];
+            inputStream.read(buffer);
+            inputStream.close();
+            String json = new String(buffer);
+            
+            JSONArray jsonArray = new JSONArray(json);
+            vocabList = new ArrayList<>();
+            for (int i = 0; i < jsonArray.length(); i++) {
+                vocabList.add(jsonArray.getString(i));
+            }
+            Log.d("VOCAB", "Loaded " + vocabList.size() + " characters from vocab.json");
+        } catch (IOException | JSONException e) {
+            Log.e("VOCAB", "Failed to load vocab.json", e);
+            // Fallback to hardcoded alphabet
+            vocabList = new ArrayList<>();
+            String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            for (char c : alphabet.toCharArray()) {
+                vocabList.add(String.valueOf(c));
+            }
+        }
+    }
+
 
 
     private void startCameraRecognition() {
@@ -481,6 +537,9 @@ public class FirstFragment extends Fragment {
         } catch (Exception e) {
             Log.e("TFLITE", "Failed to load model", e);
         }
+
+        // Load vocabulary from vocab.json
+        loadVocabFromAssets();
 
         recognitionOutput = view.findViewById(R.id.recognition_output);
 
