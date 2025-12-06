@@ -134,6 +134,17 @@
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/phrases" />
 
+    <androidx.camera.view.PreviewView
+        android:id="@+id/camera_preview"
+        android:layout_width="238dp"
+        android:layout_height="387dp"
+        android:layout_marginTop="5dp"
+        android:layout_marginEnd="16dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/phrases"
+        app:implementationMode="performance" />
+
+
     <Button
         android:id="@+id/pause2"
         style="@style/Widget.AppCompat.Button.Small"
@@ -242,7 +253,7 @@
         android:textColor="#00FF00"
         android:textSize="20sp"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@id/surfaceView" />
+        app:layout_constraintTop_toBottomOf="@id/camera_preview" />
 
     <Button
         android:id="@+id/button_camera"

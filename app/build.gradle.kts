@@ -62,9 +62,8 @@ dependencies {
     // -------------------------
     // TensorFlow Lite
     // -------------------------
-    implementation("org.tensorflow:tensorflow-lite:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.14.0") // optional but OK
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")        // for image ops
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.14.0")
 
     // -------------------------
     // Tests
@@ -72,6 +71,9 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+
+    implementation("com.google.flatbuffers:flatbuffers-java:2.0.8")
+
 }
 
 

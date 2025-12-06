@@ -32,6 +32,8 @@ import android.widget.VideoView;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
+import androidx.camera.core.Preview;
+import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
@@ -54,6 +56,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.ByteOrder;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
 import java.util.Date;
@@ -62,6 +65,7 @@ import java.util.Locale;
 import java.util.Map;
 
 import org.tensorflow.lite.Interpreter;
+
 import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import androidx.camera.core.ImageAnalysis;
@@ -89,6 +93,10 @@ public class FirstFragment extends Fragment {
     private TextView motionText = null;
 
     private SensorManager mSensorManager;
+
+    private PreviewView previewView;
+
+
     private TextView mSensorText = null;
     private Sensor mSensor;
     private SensorData mData = new SensorData();
@@ -123,7 +131,7 @@ public class FirstFragment extends Fragment {
             mData.setY(event.values[1]);
             mData.setZ(event.values[2]);
             updateSensorStateText();
-            Log.d("sensor", event.sensor.getName());
+            //Log.d("sensor", event.sensor.getName());
         }
 
         @Override
@@ -140,7 +148,7 @@ public class FirstFragment extends Fragment {
             mData.setRoty(event.values[1]);
             mData.setRotz(event.values[2]);
             updateSensorStateText();
-            Log.d("sensor", event.sensor.getName());
+            //Log.d("sensor", event.sensor.getName());
         }
 
         @Override
@@ -278,10 +286,19 @@ public class FirstFragment extends Fragment {
         Bitmap bmp = toBitmap(image);
         Bitmap resized = Bitmap.createScaledBitmap(bmp, IMG_WIDTH, IMG_HEIGHT, false);
 
-        ByteBuffer inputBuffer = ByteBuffer.allocateDirect(IMG_HEIGHT * IMG_WIDTH);
-        inputBuffer.rewind();
+        ByteBuffer inputBuffer =
+                ByteBuffer.allocateDirect(IMG_HEIGHT * IMG_WIDTH * 4);
+        inputBuffer.order(ByteOrder.nativeOrder());
 
         int[] pixels = new int[IMG_HEIGHT * IMG_WIDTH];
+        resized.getPixels(pixels, 0, IMG_WIDTH, 0, 0, IMG_WIDTH, IMG_HEIGHT);
+
+        for (int p : pixels) {
+            int r = (p >> 16) & 0xFF;
+            float normalized = (255 - r) / 255.0f;
+            inputBuffer.putFloat(normalized);
+        }
+        inputBuffer.rewind();
         resized.getPixels(pixels, 0, IMG_WIDTH, 0, 0, IMG_WIDTH, IMG_HEIGHT);
 
         for (int p : pixels) {
@@ -291,10 +308,30 @@ public class FirstFragment extends Fragment {
 
         float[][][] output = new float[1][64][63]; // your model shape
 
+        Log.d("TFLITE", "Running inference...");
+
+        long t0 = System.currentTimeMillis();
         tflite.run(inputBuffer, output);
+        long t1 = System.currentTimeMillis();
+
+        Log.d("TFLITE", "Inference complete in " + (t1 - t0) + " ms");
+        Log.d("TFLITE", "First timestep max class: " + argMax(output[0][0]));
+
 
         String text = decodeGreedy(output);
         updateRecognition(text);
+    }
+
+    private int argMax(float[] arr) {
+        int idx = 0;
+        float max = -Float.MAX_VALUE;
+        for (int i = 0; i < arr.length; i++) {
+            if (arr[i] > max) {
+                max = arr[i];
+                idx = i;
+            }
+        }
+        return idx;
     }
 
     private void updateRecognition(String text) {
@@ -303,19 +340,43 @@ public class FirstFragment extends Fragment {
 
     private Bitmap toBitmap(ImageProxy image) {
         ImageProxy.PlaneProxy[] planes = image.getPlanes();
-        ByteBuffer buffer = planes[0].getBuffer();
-        byte[] bytes = new byte[buffer.remaining()];
-        buffer.get(bytes);
+        ByteBuffer yBuffer = planes[0].getBuffer();
+        ByteBuffer uBuffer = planes[1].getBuffer();
+        ByteBuffer vBuffer = planes[2].getBuffer();
 
-        YuvImage yuvImage = new YuvImage(bytes, ImageFormat.NV21,
-                image.getWidth(), image.getHeight(), null);
+        int ySize = yBuffer.remaining();
+        int uSize = uBuffer.remaining();
+        int vSize = vBuffer.remaining();
+
+        // NV21 = Y + V + U
+        byte[] nv21 = new byte[ySize + uSize + vSize];
+
+        // Copy Y channel
+        yBuffer.get(nv21, 0, ySize);
+
+        // CameraX gives U and V swapped → fix by putting V then U
+        vBuffer.get(nv21, ySize, vSize);
+        uBuffer.get(nv21, ySize + vSize, uSize);
+
+        YuvImage yuvImage = new YuvImage(
+                nv21,
+                ImageFormat.NV21,
+                image.getWidth(),
+                image.getHeight(),
+                null
+        );
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        yuvImage.compressToJpeg(new Rect(0,0,image.getWidth(),image.getHeight()), 50, out);
+        yuvImage.compressToJpeg(
+                new Rect(0, 0, image.getWidth(), image.getHeight()),
+                90,
+                out
+        );
         byte[] jpegBytes = out.toByteArray();
 
         return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
     }
+
 
     private String decodeGreedy(float[][][] preds) {
         StringBuilder sb = new StringBuilder();
@@ -351,14 +412,8 @@ public class FirstFragment extends Fragment {
     }
 
 
-
-
-    // =============================
-    // START CAMERA + RECOGNITION
-    // =============================
     private void startCameraRecognition() {
 
-        // ===== STEP 2: Camera permission check =====
         if (ActivityCompat.checkSelfPermission(
                 getContext(), Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
 
@@ -367,9 +422,8 @@ public class FirstFragment extends Fragment {
                     new String[]{Manifest.permission.CAMERA},
                     1001
             );
-            return; // STOP, cannot start camera yet
+            return;
         }
-        // ============================================
 
         ListenableFuture<ProcessCameraProvider> cameraProviderFuture =
                 ProcessCameraProvider.getInstance(getContext());
@@ -378,32 +432,39 @@ public class FirstFragment extends Fragment {
             try {
                 ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
 
+                // PREVIEW USE-CASE
+                Preview preview = new Preview.Builder().build();
+                preview.setSurfaceProvider(previewView.getSurfaceProvider());
+
+                // IMAGE ANALYSIS USE-CASE
                 ImageAnalysis analysis = new ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build();
 
-                analysis.setAnalyzer(
-                        Runnable::run,
-                        image -> {
-                            runRecognition(image);
-                            image.close();
-                        }
-                );
+                analysis.setAnalyzer(ContextCompat.getMainExecutor(getContext()), image -> {
+                    try {
+                        runRecognition(image);
+                    } finally {
+                        image.close();
+                    }
+                });
 
-                CameraSelector cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA;
+                CameraSelector selector = CameraSelector.DEFAULT_BACK_CAMERA;
 
                 cameraProvider.unbindAll();
                 cameraProvider.bindToLifecycle(
                         this,
-                        cameraSelector,
+                        selector,
+                        preview,
                         analysis
                 );
 
             } catch (Exception e) {
-                Log.e("CAMERA", "CameraX init error", e);
+                Log.e("CAMERA", "CameraX start error", e);
             }
         }, ContextCompat.getMainExecutor(getContext()));
     }
+
 
 
 
@@ -422,6 +483,9 @@ public class FirstFragment extends Fragment {
         }
 
         recognitionOutput = view.findViewById(R.id.recognition_output);
+
+        previewView = view.findViewById(R.id.camera_preview);
+
 
         // Start continuous recognition
         startCameraRecognition();
